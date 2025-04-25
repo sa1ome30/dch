@@ -1,0 +1,128 @@
+import requests
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from bs4 import BeautifulSoup
+import json
+import time
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import openai
+import re
+
+app = Flask(__name__)
+CORS(app)
+openai.api_key = '"
+
+
+def extract_json_from_gpt(content):
+    try:
+        json_str = re.search(r'\{.*}', content, re.DOTALL).group()
+        return json.loads(json_str)
+    except Exception as e:
+        print("[!] Failed to extract clean JSON")
+        print("Raw GPT Response:\n", content)
+        return None
+
+
+def extract_text_from_div(url):
+    options = Options()
+    options.headless = True
+    driver = webdriver.Chrome(options=options)
+    driver.get(url)
+    time.sleep(5)
+    try:
+        div_element = driver.find_element(By.XPATH, "//body//div[1]")  # Option 1
+        text_content = div_element.text
+        return text_content
+    except Exception as e:
+        print(f"[!] Selenium error: {e}")
+        return None
+    finally:
+        driver.quit()
+
+def get_tos_text_directly(url):
+    try:
+        response = requests.get(url, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        terms_keywords = ['terms of service', 'tos', 'terms and conditions', 't&c']
+        tos_text = []
+        elements = soup.find_all(['p', 'div', 'section', 'article'])
+        for element in elements:
+            element_text = element.get_text().lower()
+            if any(keyword in element_text for keyword in terms_keywords):
+                tos_text.append(element.get_text())
+        if tos_text:
+            return '\n'.join(tos_text)
+        else:
+            return "[!] No TOS or T&C text found on this page."
+    except Exception as e:
+        print(f"[!] Requests error: {e}")
+        return None
+
+
+def summarize_tos(tos_text):
+    response = openai.ChatCompletion.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a highly strict data extraction API that ONLY returns valid JSON. You NEVER write anything else."},
+            {"role": "user", "content": f"""
+            Analyze this Terms of Service text.
+
+            Output ONLY valid JSON like this:
+
+            {{
+              "summary": "Medium length detailed summary.",
+              "green_flags": ["List all good points in bullet form."],
+              "red_flags": ["List all bad points in bullet form."]
+            }}
+
+            Here is the TOS Text:
+            {tos_text}
+            """}
+
+        ]
+    )
+    content = response['choices'][0]['message']['content']
+    result = extract_json_from_gpt(content)
+
+    if result is None:
+        return {
+            "summary": "Error: GPT response not in JSON format.",
+            "green_flags": [],
+            "red_flags": []
+        }
+
+    return result
+
+
+@app.route('/receive-url', methods=['POST'])
+def receive_url():
+    data = request.get_json()
+
+    if 'url' in data:
+        url = data['url']
+        direct_text = get_tos_text_directly(url)
+        selenium_text = extract_text_from_div(url)
+
+        if direct_text and "[!]" not in direct_text:
+            result = summarize_tos(direct_text)
+        elif selenium_text:
+            result = summarize_tos(selenium_text)
+        else:
+            return jsonify({"error": "Failed to extract TOS content"}), 400
+
+        summary = result['summary']
+        green_flags = result['green_flags']
+        red_flags = result['red_flags']
+
+        return jsonify({
+            "summary": summary,
+            "green_flags": green_flags,
+            "red_flags": red_flags
+        }), 200
+    else:
+        return jsonify({"error": "No URL found in request"}), 400
+# Main flow
+if __name__ == "__main__":
+    app.run(debug=True, host='0.0.0.0', port=5000)
